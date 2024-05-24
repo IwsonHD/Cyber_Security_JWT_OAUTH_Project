@@ -8,12 +8,12 @@ from datetime import datetime, timedelta
 from functools import wraps
 import requests
 
-countryWhiteList = ['Poland','France', 'Germany', 'England']
+countryWhiteList = ['Poland','France', 'Germany', 'England',None]
 # Create Flask application
 app = Flask(__name__)
 
 # Configure Flask app
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'your_secret_key')
+app.config['SECRET_KEY'] = str(os.getenv('SECRET_KEY'))
 app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///Database.db'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
@@ -96,13 +96,14 @@ def abac_guard(action):
                 data = jwt.decode(token, app.config['SECRET_KEY'])
                 current_user = User.query.filter_by(public_id=data['public_id']).first()
                 resource_id = kwargs.get('id')
-                resource = Resource.query.filter_by(id=resource_id).first()
+
+                resource = Resource.query.filter_by(public_id=resource_id).first()
 
                 if not resource:
                     return jsonify({'message': 'Resource not found !!'}), 404
 
                 user_country = get_country_from_ip(request.remote_addr)
-
+                print(user_country)
                 if user_country not in countryWhiteList:
                     return jsonify({'message': 'Access denied. Only users from Poland can access this resource.'}), 403
 
@@ -114,11 +115,12 @@ def abac_guard(action):
             except jwt.InvalidTokenError:
                 return jsonify({'message': 'Invalid token !!'}), 401
 
-            return f(current_user, resource, *args, **kwargs)
+            return f(current_user, resource, action, *args, **kwargs)  # Dodaj action tutaj
 
         return decorated_function
 
     return decorator
+
 
 @app.route('/users', methods=['GET'])
 def get_all_users():
@@ -217,10 +219,10 @@ def login():
     if check_password_hash(user.password, auth.get('password')):
         token = jwt.encode({
             'public_id': user.public_id,
-            'exp': datetime.now() + timedelta(minutes=30)
+            'exp': datetime.utcnow() + timedelta(minutes=30)
         }, app.config['SECRET_KEY'])
 
-        return jsonify({'token': token}), 201
+        return jsonify({'token': token.decode('UTF-8')}), 201
 
     return jsonify({'error': 'Could not verify'}), 403
 
@@ -248,7 +250,7 @@ def signup():
 
     return jsonify({'message': 'Successfully registered.'}), 201
 
-@app.route('/resources/<int:id>', methods=['GET'])
+@app.route('/resources/<string:id>', methods=['GET'])
 @abac_guard('read')
 def get_resource(current_user, id):
     resource = Resource.query.filter_by(id=id).first()
@@ -262,10 +264,10 @@ def get_resource(current_user, id):
     }
     return jsonify({'resource': resource_data}), 200
 
-@app.route('/resources/<int:id>', methods=['DELETE'])
+@app.route('/resources/<string:id>', methods=['DELETE'])
 @abac_guard('delete')
-def delete_resource(current_user, id):
-    resource = Resource.query.filter_by(id=id).first()
+def delete_resource(current_user, resource, action, id):
+    resource = Resource.query.filter_by(public_id=id).first()
     if not resource:
         return jsonify({'message': 'No resource found !!'}), 404
 
@@ -273,6 +275,7 @@ def delete_resource(current_user, id):
     db.session.commit()
 
     return jsonify({'message': 'Resource deleted successfully !!'}), 200
+
 @app.route('/resources', methods=['GET'])
 def get_all_resources():
     resources = Resource.query.all()
@@ -281,10 +284,10 @@ def get_all_resources():
         output.append({
             'public_id': resource.public_id,
             'name': resource.name,
-            'content': resource.email
+            'content': resource.content
         })
 
-    return jsonify({'users': output}), 200
+    return jsonify({'resources': output}), 200
 
 def initialize_resources():
     resources = [
@@ -317,13 +320,13 @@ def initialize_resources():
     db.session.commit()
     
 @app.route('/resources', methods=['POST'])
-@abac_guard('add')
+@auth_guard('admin')
 def create_resource(current_user):
     data = request.json
     name = data.get('name')
     content = data.get('content')
     country_availability = data.get('country_availability')
-    owner_id = current_user.pulic_id
+    owner_id = current_user.public_id
     
     resource = Resource.query.filter_by(name=name).first()
     if resource:
@@ -340,7 +343,7 @@ def create_resource(current_user):
     db.session.add(resource)
     db.session.commit()
 
-    return jsonify({'message': 'User created successfully.'}), 201
+    return jsonify({'message': 'Resource created successfully.'}), 201
 
 
 if __name__ == "__main__":
@@ -348,4 +351,4 @@ if __name__ == "__main__":
 		db.create_all()
     
 	app.run(debug=False, port=5001)
-	initialize_resources()
+	
