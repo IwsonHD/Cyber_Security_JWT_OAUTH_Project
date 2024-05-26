@@ -6,9 +6,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import jwt
 from datetime import datetime, timedelta
 from functools import wraps
-import requests
 
-countryWhiteList = ['Poland','France', 'Germany', 'England',None]
 # Create Flask application
 app = Flask(__name__)
 
@@ -28,6 +26,8 @@ class User(db.Model):
     email = db.Column(db.String(70), unique=True)
     password = db.Column(db.String(80))
     role = db.Column(db.String(20))
+    country = db.Column(db.String(50))
+    level = db.Column(db.Integer)
 
 class Resource(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -35,26 +35,8 @@ class Resource(db.Model):
     name = db.Column(db.String(100))
     owner_id = db.Column(db.String(50))
     content = db.Column(db.String(200))
-    country_availability = db.Column(db.String(50), nullable=True)
 
-def abac_policy(current_user, resource, action):
-    if current_user.role == 'admin':
-        return True
-    if current_user.role != 'admin' and action == 'read':
-        return True
-    return False
 
-def get_country_from_ip(ip):
-    try:
-        response = requests.get(f"http://ip-api.com/json/{ip}")
-        data = response.json()
-        country = data.get('country')
-        return country
-    except Exception as e:
-        print("Error occurred while fetching country from IP:", e)
-        return None
-
-# Role-based access decorator
 def auth_guard(role=None):
     def decorator(f):
         @wraps(f)
@@ -84,38 +66,56 @@ def auth_guard(role=None):
 
     return decorator
 
-def abac_guard(action):
+
+def location_policy(data, required_location):
+    return data['location'] == required_location
+
+def access_level_policy(data, required_level):
+    return data['access_level'] >= required_level
+
+
+# Example policies dictionary
+policies = {
+    'location_access': location_policy,
+    'level_access': access_level_policy
+}
+
+def evaluate_claims_policies(data, policy_name, policy_arg):
+    policy = policies.get(policy_name)
+    if policy:
+        return policy(data, policy_arg)
+    return False
+
+
+def abac_guard(policies=None):
     def decorator(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
-            token = request.headers.get('x-access-token')
+            token = None
+            if 'x-access-token' in request.headers:
+                token = request.headers['x-access-token']
+
             if not token:
                 return jsonify({'message': 'Token is missing !!'}), 401
 
             try:
-                data = jwt.decode(token, app.config['SECRET_KEY'])
+                data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
                 current_user = User.query.filter_by(public_id=data['public_id']).first()
-                resource_id = kwargs.get('id')
 
-                resource = Resource.query.filter_by(public_id=resource_id).first()
+                if not current_user:
+                    return jsonify({'message': 'User not found !!'}), 401
 
-                if not resource:
-                    return jsonify({'message': 'Resource not found !!'}), 404
-
-                user_country = get_country_from_ip(request.remote_addr)
-                print(user_country)
-                if user_country not in countryWhiteList:
-                    return jsonify({'message': 'Access denied. Only users from Poland can access this resource.'}), 403
-
-                if not abac_policy(current_user, resource, action):
-                    return jsonify({'message': 'Access denied !!'}), 403
+                if policies is not None:
+                    for policy_name, policy_args in policies:
+                        if not evaluate_claims_policies(data, policy_name, policy_args):
+                            return jsonify({'message': 'Unauthorized access !!'}), 403
 
             except jwt.ExpiredSignatureError:
                 return jsonify({'message': 'Token is expired !!'}), 401
             except jwt.InvalidTokenError:
                 return jsonify({'message': 'Invalid token !!'}), 401
 
-            return f(current_user, resource, action, *args, **kwargs)  # Dodaj action tutaj
+            return f(current_user, *args, **kwargs)
 
         return decorated_function
 
@@ -219,7 +219,9 @@ def login():
     if check_password_hash(user.password, auth.get('password')):
         token = jwt.encode({
             'public_id': user.public_id,
-            'exp': datetime.utcnow() + timedelta(minutes=30)
+            'exp': datetime.utcnow() + timedelta(minutes=30),
+            'location': user.country,
+            'access_level': user.level
         }, app.config['SECRET_KEY'])
 
         return jsonify({'token': token.decode('UTF-8')}), 201
@@ -232,7 +234,9 @@ def signup():
     name = data.get('name')
     email = data.get('email')
     password = data.get('password')
-    role = data.get('role', 'user')  # Default role is 'user'
+    role = data.get('role', 'user')
+    level = data.get('level', 1)
+    country = data.get('country', 'Poland')
 
     user = User.query.filter_by(email=email).first()
     if user:
@@ -243,7 +247,9 @@ def signup():
         name=name,
         email=email,
         password=generate_password_hash(password),
-        role=role
+        role=role,
+        level=level,
+        country=country
     )
     db.session.add(user)
     db.session.commit()
@@ -251,7 +257,7 @@ def signup():
     return jsonify({'message': 'Successfully registered.'}), 201
 
 @app.route('/resources/<string:id>', methods=['GET'])
-@abac_guard('read')
+@abac_guard(policies=[('location_access', 'Poland'), ('level_access', 100)])
 def get_resource(current_user, id):
     resource = Resource.query.filter_by(id=id).first()
     if not resource:
@@ -264,8 +270,9 @@ def get_resource(current_user, id):
     }
     return jsonify({'resource': resource_data}), 200
 
+
 @app.route('/resources/<string:id>', methods=['DELETE'])
-@abac_guard('delete')
+@abac_guard(policies=[('level_access', 100)])
 def delete_resource(current_user, resource, action, id):
     resource = Resource.query.filter_by(public_id=id).first()
     if not resource:
@@ -289,35 +296,6 @@ def get_all_resources():
 
     return jsonify({'resources': output}), 200
 
-def initialize_resources():
-    resources = [
-        {
-            'name': 'Sample Resource 1',
-            'content': 'Content of Sample Resource 1',
-            'country_availability': 'Poland'
-        },
-        {
-            'name': 'Sample Resource 2',
-            'content': 'Content of Sample Resource 2',
-            'country_availability': 'France'
-        },
-        {
-            'name': 'Sample Resource 3',
-            'content': 'Content of Sample Resource 3',
-            'country_availability': 'Germany'
-        }
-    ]
-
-    for resource_data in resources:
-        resource = Resource(
-            public_id=str(uuid.uuid4()),
-            name=resource_data['name'],
-            content=resource_data['content'],
-            country_availability=resource_data['country_availability']
-        )
-        db.session.add(resource)
-
-    db.session.commit()
     
 @app.route('/resources', methods=['POST'])
 @auth_guard('admin')
@@ -325,7 +303,6 @@ def create_resource(current_user):
     data = request.json
     name = data.get('name')
     content = data.get('content')
-    country_availability = data.get('country_availability')
     owner_id = current_user.public_id
     
     resource = Resource.query.filter_by(name=name).first()
@@ -336,9 +313,8 @@ def create_resource(current_user):
 		public_id=str(uuid.uuid4()),
     	name = name,
     	owner_id = owner_id,
-    	content = content,
-   	 	country_availability = country_availability
-	)
+    	content = content
+    )
 
     db.session.add(resource)
     db.session.commit()
